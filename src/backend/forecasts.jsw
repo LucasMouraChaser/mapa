@@ -1,0 +1,149 @@
+import wixData from 'wix-data';
+import { currentUser } from 'wix-users-backend';
+
+/* ====================================================================
+   BACK-END · Forecasts / Reports  –  COMPLETO
+   (nada removido; apenas adequações para coleção “relatos” que guarda
+   data (“date”, texto DD/MM/YYYY) e hora (“hora”, texto HH:mm:ss)
+==================================================================== */
+
+/* ---------- grava PREVISÃO --------------------------------------- */
+export async function saveForecast({ memberId, dateISO, dayType, geojson }) {
+  if (!dateISO || !dayType || !geojson) {
+    throw new Error('Parâmetros obrigatórios ausentes.');
+  }
+
+  // determina o ID do usuário (passado ou, se ausente, do usuário logado)
+  const userId = memberId || currentUser.id;
+
+  // monta o _nick_ do membro: busca no PrivateMembersData
+  let nick = '—';
+  try {
+    const { items: members } = await wixData
+      .query('Members/PrivateMembersData')
+      .eq('_id', userId)
+      .limit(1)
+      .find();
+    if (members.length) {
+      const m = members[0];
+      nick = m.fullName
+        || [m.firstName, m.lastName].filter(Boolean).join(' ') 
+        || '—';
+    }
+  } catch (e) {
+    console.error('Erro ao buscar nick do membro', e);
+  }
+
+  const _id = `${userId}_${dateISO}_${dayType}_${Date.now()}`;
+
+  return wixData.insert('Forecasts', {
+    _id,
+    memberId: userId,
+    dateISO,
+    dayType,
+    geojsonStr: JSON.stringify(geojson),   // formato novo
+    geojson,                                // legado
+    nick                                    // grava nick diretamente
+  });
+}
+
+/* ---------- devolve a ÚLTIMA previsão ---------------------------- */
+export async function getLatestForecast(memberId, dateISO) {
+  const { items } = await wixData.query('Forecasts')
+    .eq('memberId', memberId)
+    .eq('dateISO',  dateISO)
+    .descending('_updatedDate')
+    .limit(1)
+    .find({ suppressAuth:true });
+
+  if (!items.length) return null;
+
+  const doc = items[0];
+  if (doc.geojsonStr) {
+    try { return JSON.parse(doc.geojsonStr); } catch (_) {}
+  }
+  if (doc.geojson) {
+    try { return JSON.parse(JSON.stringify(doc.geojson)); } catch (_) {}
+  }
+  return null;
+}
+
+/* ---------- util: “DD/MM/YYYY” + “HH:mm:ss” -> Date -------------- */
+const TZ_OFFSET = '-03:00';                       // ajuste se mudar de fuso
+function txtToDate(dateTxt, timeTxt) {
+  // dateTxt = "25/04/2025", timeTxt = "13:40:00"
+  const [d, m, y] = dateTxt.split('/');
+  return new Date(`${y}-${m}-${d}T${timeTxt || '00:00:00'}${TZ_OFFSET}`);
+}
+
+/* ------------------------------------------------------------------
+   1. Consulta relatos para uma DATA (YYYY-MM-DD)
+------------------------------------------------------------------ */
+export async function fetchReports(dateISO) {
+  // "2025-04-25" → "25/04/2025"
+  const [y, m, d] = dateISO.split('-');
+  const dateStr   = `${d}/${m}/${y}`;
+
+  const { items } = await wixData.query('relatos')
+    .eq('date', dateStr)
+    .find({ suppressAuth:true });
+
+  return items.map(it => ({
+    lat   : it.lat,
+    lng   : it.lon,
+    hazard: (it.hazard || '').toLowerCase(),
+    hora  : it.hora,
+    date  : it.date
+  }));
+}
+
+/* ------------------------------------------------------------------
+   2. Relatos entre startISO ≤ ts < endISO
+      (startISO / endISO em ISO-8601, ex: 2025-04-26T11:00:00-03:00)
+------------------------------------------------------------------ */
+export async function fetchReportsByTimeWindow(startISO, endISO) {
+  const start = new Date(startISO);
+  const end   = new Date(endISO);
+
+  /* puxamos apenas os dois dias envolvidos para reduzir leitura */
+  const d0DMY = startISO.slice(0,10).split('-').reverse().join('/');
+  const d1DMY = endISO.slice(0,10).split('-').reverse().join('/');
+
+  const { items } = await wixData.query('relatos')
+    .hasSome('date', [d0DMY, d1DMY])
+    .find({ suppressAuth:true });
+
+  return items.filter(it => {
+    const ts = txtToDate(it.date, it.hora);
+    return ts >= start && ts < end;
+  }).map(it => ({
+    lat   : it.lat,
+    lng   : it.lon,
+    hazard: (it.hazard || '').toLowerCase(),
+    hora  : it.hora,
+    date  : it.date
+  }));
+}
+
+/* ------------------------------------------------------------------
+   3. Relatos de HOJE após DEADLINE (11:00 LT)
+------------------------------------------------------------------ */
+export async function fetchReportsAfterDeadline() {
+  const now   = new Date();
+  const iso   = now.toISOString().slice(0,10);             // YYYY-MM-DD
+  const dmy   = iso.split('-').reverse().join('/');        // DD/MM/YYYY
+  const DEAD  = txtToDate(dmy, '11:00:00');                // 11 h LT
+
+  const { items } = await wixData.query('relatos')
+    .eq('date', dmy)
+    .find({ suppressAuth:true });
+
+  return items.filter(it => txtToDate(it.date, it.hora) >= DEAD)
+              .map(it => ({
+                lat   : it.lat,
+                lng   : it.lon,
+                hazard: (it.hazard || '').toLowerCase(),
+                hora  : it.hora,
+                date  : it.date
+              }));
+}

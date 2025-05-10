@@ -1,0 +1,253 @@
+// backend/ranking.jsw
+import wixData from 'wix-data';
+
+// converte "YYYY-MM-DD" → "DD/MM/YYYY"
+function toBR(d) {
+  const [Y, M, D] = d.split('-');
+  return `${D.padStart(2, '0')}/${M.padStart(2, '0')}/${Y}`;
+}
+
+// gera lista de strings ISO de from→to (inclusive)
+function isoRange(from, to) {
+  const dates = [];
+  const cur = new Date(from), end = new Date(to);
+  while (cur <= end) {
+    dates.push(cur.toISOString().slice(0, 10));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return dates;
+}
+
+export async function get_ranking_list({ query: { from, to } }) {
+  // 1) montar listas de datas em ISO e BR
+  const isoList = isoRange(from, to);
+  const brList  = isoList.map(toBR);
+
+  // 2) buscar Forecasts no período
+  let fq = wixData.query('Forecasts');
+  if (isoList.length) {
+    fq = fq.eq('dateISO', isoList[0]);
+    for (let i = 1; i < isoList.length; i++) {
+      fq = fq.or(wixData.query('Forecasts').eq('dateISO', isoList[i]));
+    }
+  }
+  const { items: forecasts = [] } = await fq.limit(1000).find();
+
+  // 3) buscar Relatos cujo campo `date` (DD/MM/YYYY) esteja no intervalo
+  let rq = wixData.query('relatos').eq('date', brList[0]);
+  for (let i = 1; i < brList.length; i++) {
+    rq = rq.or(wixData.query('relatos').eq('date', brList[i]));
+  }
+  const { items: rawReports = [] } = await rq
+    .limit(1000)
+    .find({ suppressAuth: true });
+
+  // 3a) converter cada relato em eventDate (UTC) usando date+hora em BRT (UTC−3)
+  const reports = rawReports.map(r => {
+    const [dd, MM, YYYY] = r.date.split('/');
+    // assume r.hora está em "HH:mm:ss"
+    const eventISO = `${YYYY}-${MM}-${dd}T${r.hora}-03:00`;
+    return {
+      ...r,
+      eventDate: new Date(eventISO)
+    };
+  });
+
+  // 4) manter apenas a ÚLTIMA forecast de cada usuário em cada dia
+  const latestMap = new Map();
+  for (const fc of forecasts) {
+    const key = `${fc.memberId}|${fc.dateISO}`;
+    const prev = latestMap.get(key);
+    if (!prev || new Date(prev._createdDate) < new Date(fc._createdDate)) {
+      latestMap.set(key, fc);
+    }
+  }
+  const filteredForecasts = Array.from(latestMap.values());
+
+  // 5) configurações de pontuação e deflator
+  const turf       = await import('@turf/turf');
+  const weights    = { granizo:5, vento:7, tornado:10 };
+  const ssBonus    = { granizo:2, vento:3, tornado:4 };
+  const outPenalty = { granizo:-3, vento:-3, tornado:-3 };
+  const pctByRisk  = {
+    granizo: {1:0.05, 2:0.15, 3:0.30, 4:0.45},
+    vento:   {1:0.05, 2:0.15, 3:0.30, 4:0.45},
+    tornado: {1:0.02, 2:0.05, 3:0.10, 4:0.15}
+  };
+  const defW       = {1:2, 2:4, 3:7, 4:10};
+
+  // mapeia o `type` do GeoJSON (em inglês) para o campo `hazard` dos relatos (em pt)
+  const forecastTypeMap = {
+    hail:    'granizo',
+    wind:    'vento',
+    tornado: 'tornado'
+  };
+
+  const rankMap = {};
+
+  // 6) para cada forecast (usuário + dia)
+  for (const fc of filteredForecasts) {
+    const nick = (fc.nick || '—').trim();
+    const uid  = fc.memberId;
+    if (!rankMap[uid]) {
+      rankMap[uid] = {
+        nick,
+        days:        new Set(),
+        hailPts:     0,
+        windPts:     0,
+        tornPts:     0,
+        deflatorPts: 0
+      };
+    }
+    const acc = rankMap[uid];
+    acc.days.add(fc.dateISO);
+
+    // parsear GeoJSON e extrair polígonos
+    let gj = fc.geojson;
+    if (typeof gj === 'string') {
+      try { gj = JSON.parse(gj); } catch { gj = null; }
+    }
+    const polys = (gj?.features || []).filter(f => f.geometry?.type === 'Polygon');
+    if (!polys.length) continue;
+
+    // ANTI-FRAUDE N1
+    const n1Polys = polys.filter(f => f.properties.level === '1');
+    if (n1Polys.length) {
+      const area1 = n1Polys.map(f => turf.area(f)).reduce((s,a) => s + a, 0) / 1e6;
+      if (area1 > 120000) {
+        acc.deflatorPts += 10;
+        console.log(`⚠️ ${nick}: área N1=${area1.toFixed(0)}km² >120000 → +10 deflator pts`);
+      }
+    }
+
+    const myDateBR = toBR(fc.dateISO);
+
+    // 7) para cada tipo de risco desenhado
+    const featTypes = Array.from(new Set(polys.map(f => f.properties.type)));
+    for (const featType of featTypes) {
+    const hazardType = forecastTypeMap[featType];
+    if (!hazardType) continue;
+
+    const hazardPolys = polys.filter(f => f.properties.type === featType);
+
+    // ── 7a) cálculo de área e células 80×80 ───────────────────────────
+    const aByLvl  = {};
+    const cByLvl  = {};
+    for (const f of hazardPolys) {
+      const lvl = Number(f.properties.level);
+      aByLvl[lvl] = (aByLvl[lvl] || 0) + turf.area(f) / 1e6;  // km²
+    }
+    console.log(`--- ${hazardType.toUpperCase()} (${nick}) ---`);
+    for (const lvl in aByLvl) {
+      cByLvl[lvl] = aByLvl[lvl] / (80 * 80);
+      console.log(
+        `ℹ️ Nível ${lvl}: área total = ${aByLvl[lvl].toFixed(2)} km² → ` +
+        `células 80×80 = ${cByLvl[lvl].toFixed(2)}`
+      );
+    }
+
+    // ── 7b) contar relatos e “SS” dentro dos polígonos ───────────────
+    const countRep = {};
+    const countSS  = {};
+    for (const lvl in cByLvl) {
+      countRep[lvl] = 0;
+      countSS[lvl]  = 0;
+    }
+
+    // janela 12UTC→12UTC para este dia
+    const dayStart = new Date(`${fc.dateISO}T12:00:00Z`);
+    const dayEnd   = new Date(dayStart);
+    dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+    for (const rep of reports) {
+      const created = new Date(rep._createdDate);
+      if (created < dayStart || created >= dayEnd) continue;
+      if (rep.hazard !== hazardType) continue;
+
+      const pt = turf.point([rep.lon, rep.lat]);
+      for (const poly of hazardPolys) {
+        if (turf.booleanPointInPolygon(pt, poly)) {
+          const lvl = Number(poly.properties.level);
+          countRep[lvl]++;
+          if (String(rep.sev || '').toUpperCase() === 'SS') {
+            countSS[lvl]++;
+          }
+          break;
+        }
+      }
+    }
+
+    console.log(`✅ relatos por nível (${hazardType}):`, countRep);
+    console.log(`✅ “SS” por nível   (${hazardType}):`, countSS);
+
+// 8) deflatores e bônus por célula faltante
+for (const lvl in cByLvl) {
+  const cells        = cByLvl[lvl];
+  const expectedPct  = pctByRisk[hazardType][lvl];
+  const expectedCells= Math.ceil(cells * expectedPct);
+  const actualCells  = countRep[lvl] || 0;
+
+  if (actualCells < expectedCells) {
+    const missing = expectedCells - actualCells;
+    // aplica peso extra para N3 e N4:
+    const weight   = defW[lvl] * (lvl==='3' ? 2 : lvl==='4' ? 3 : 1);
+    const pen      = missing * weight;
+    acc.deflatorPts += pen;
+    console.log(
+      `⚠️ ${nick}: ${hazardType} N${lvl} — ` +
+      `esperava=${expectedCells} células, recebeu=${actualCells} → +${pen} pts`
+    );
+  }
+
+  // SS obrigatório para N3
+  if (lvl==='3' && (countSS[3]||0) < 1) {
+    const pen3 = defW[3] * 4;      // 2× mais severo que antes
+    acc.deflatorPts += pen3;
+    console.log(`⚠️ ${nick}: ${hazardType} N3 falta SS → +${pen3} pts`);
+  }
+  // SS ≥10% das células em N4
+  if (lvl==='4') {
+    const expectedSS = Math.ceil(cells * 0.10);
+    const gotSS      = countSS[4] || 0;
+    if (gotSS < expectedSS) {
+      const pen4 = (expectedSS - gotSS) * defW[4] * 5;  // 3× mais severo
+      acc.deflatorPts += pen4;
+      console.log(
+        `⚠️ ${nick}: ${hazardType} N4 SS req=${expectedSS}, got=${gotSS} → +${pen4} pts`
+      );
+    }
+  }
+}
+
+      // 9) pontuação padrão por relato
+      for (const rep of reports) {
+        if (rep.eventDate < dayStart || rep.eventDate >= dayEnd) continue;
+        if (rep.hazard !== hazardType) continue;
+
+        const pt     = turf.point([rep.lon, rep.lat]);
+        const inside = hazardPolys.some(p => turf.booleanPointInPolygon(pt, p));
+        const sev    = String(rep.sev || '').toUpperCase();
+        let pts      = inside
+          ? weights[hazardType] + (sev === 'SS' ? ssBonus[hazardType] : 0)
+          : outPenalty[hazardType] * (sev === 'SS' ? 2 : 1);
+
+        if (hazardType === 'granizo') acc.hailPts += pts;
+        if (hazardType === 'vento')   acc.windPts += pts;
+        if (hazardType === 'tornado') acc.tornPts += pts;
+      }
+    }
+  }
+
+  // 10) montar ranking final
+  return Object.values(rankMap)
+    .map((r, i) => ({
+      pos:           i + 1,
+      playerName:    r.nick,
+      daysCount:     r.days.size,
+      hailPoints:    r.hailPts,
+      windPoints:    r.windPts,
+      tornadoPoints: r.tornPts,
+      totalPoints:   r.hailPts + r.windPts + r.tornPts - (r.deflatorPts || 0)
+    }))
+    .sort((a, b) => b.totalPoints - a.totalPoints);
+}

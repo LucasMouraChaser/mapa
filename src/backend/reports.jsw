@@ -1,0 +1,62 @@
+// backend/reports.jsw
+import wixData from 'wix-data';
+
+export async function create(relato) {
+  // 1) pegar agora em UTC e decidir o dia BRT (09:00 BRT = 12:00 UTC)
+  const now = new Date();
+  const hourUTC = now.getUTCHours();
+
+  // se for antes de 12 UTC (i.e. antes de 09 BRT) → pertence ao “dia anterior” em BRT
+  const base = hourUTC < 12
+    ? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1))
+    : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+
+  // 2) formata DD/MM/YYYY
+  const pad = n => String(n).padStart(2,'0');
+  const deadline = `${pad(base.getUTCDate())}/${pad(base.getUTCMonth()+1)}/${base.getUTCFullYear()}`;
+
+  // 3) monta o doc exatamente como antes, mas usando o `deadline` calculado
+  const full = new Date(relato.dateISO);
+  const date = `${pad(full.getUTCDate())}/${pad(full.getUTCMonth()+1)}/${full.getUTCFullYear()}`;
+  const hora = relato.hora?.trim()
+    || `${pad(full.getUTCHours())}:${pad(full.getUTCMinutes())}:${pad(full.getUTCSeconds())}`;
+
+  const doc = {
+    date,             // DD/MM/YYYY (data “bruta” do evento)
+    hora,             // hora nominal
+    hazard: relato.hazard,
+    sev:    relato.sev,
+    lat:    relato.lat,
+    lon:    relato.lon,
+    autor:  relato.autor || 'admin',
+  };
+
+  return wixData.insert('relatos', doc);
+}
+
+export async function fetchReports({ dateISO }) {
+  // 1) converte "2025-05-08" → "08/05/2025"
+  const [Y,M,D] = dateISO.split('-');
+  const brDate = `${D}/${M}/${Y}`;
+
+  // 2) busca todos os relatos com campo date === brDate
+  const res = await wixData
+    .query('relatos')
+    .eq('date', brDate)
+    .find();
+
+  // 3) mapeia para GeoJSON
+  const features = res.items.map(item => ({
+    type: 'Feature',
+    properties: {
+      hazard: item.hazard,
+      sev:    item.sev
+    },
+    geometry: {
+      type: 'Point',
+      coordinates: [item.lon, item.lat]
+    }
+  }));
+
+  return { features };
+}

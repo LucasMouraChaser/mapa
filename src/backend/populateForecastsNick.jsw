@@ -1,0 +1,32 @@
+// backend/populateForecastsNick.jsw
+import wixData from 'wix-data';
+
+export async function populateForecastsNick() {
+  const { items: forecasts } = await wixData.query('Forecasts').limit(1000).find();
+  const userIds = [...new Set(forecasts.map(f=>f.memberId))].filter(Boolean);
+  if (!userIds.length) return { message: 'Nenhum forecast com memberId.' };
+
+  let mQ = wixData.query('Members/PrivateMembersData').eq('_id', userIds[0]);
+  userIds.slice(1).forEach(id =>
+    mQ = mQ.or(wixData.query('Members/PrivateMembersData').eq('_id', id))
+  );
+  const { items: members } = await mQ.limit(1000).find();
+  const memberMap = new Map(members.map(m => [m._id, m]));
+
+  let updated = 0;
+  for (const fc of forecasts) {
+    const member = memberMap.get(fc.memberId);
+    if (!member) continue;
+    const newNick = [member.firstName, member.lastName].filter(Boolean).join(' ');
+    if (newNick && newNick !== fc.nick) {
+      // 1) lê todo o documento
+      const full = await wixData.get('Forecasts', fc._id);
+      // 2) modifica apenas o nick
+      full.nick = newNick;
+      // 3) grava *tudo* de volta, preservando o resto
+      await wixData.save('Forecasts', full);
+      updated++;
+    }
+  }
+  return { message: `Foram atualizados ${updated} nick(s).` };
+}
